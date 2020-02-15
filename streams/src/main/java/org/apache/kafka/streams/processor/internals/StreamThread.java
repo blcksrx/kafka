@@ -502,7 +502,8 @@ public class StreamThread extends Thread {
     private final Sensor commitSensor;
     private final Sensor pollSensor;
     private final Sensor punctuateSensor;
-    private final Sensor processSensor;
+    private final Sensor processLatencySensor;
+    private final Sensor processRateSensor;
 
     private long now;
     private long lastPollMs;
@@ -637,7 +638,8 @@ public class StreamThread extends Thread {
         this.streamsMetrics = streamsMetrics;
         this.commitSensor = ThreadMetrics.commitSensor(threadId, streamsMetrics);
         this.pollSensor = ThreadMetrics.pollSensor(threadId, streamsMetrics);
-        this.processSensor = ThreadMetrics.processSensor(threadId, streamsMetrics);
+        this.processLatencySensor = ThreadMetrics.processLatencySensor(threadId, streamsMetrics);
+        this.processRateSensor = ThreadMetrics.processRateSensor(threadId, streamsMetrics);
         this.punctuateSensor = ThreadMetrics.punctuateSensor(threadId, streamsMetrics);
 
         // The following sensors are created here but their references are not stored in this object, since within
@@ -802,6 +804,13 @@ public class StreamThread extends Thread {
             throw new StreamsException(logPrefix + "Unexpected state " + state + " during normal iteration");
         }
 
+        final long pollLatency = advanceNowAndComputeLatency();
+
+        if (records != null && !records.isEmpty()) {
+            pollSensor.record(pollLatency, now);
+            addRecordsToTasks(records);
+        }
+
         // Shutdown hook could potentially be triggered and transit the thread state to PENDING_SHUTDOWN during #pollRequests().
         // The task manager internal states could be uninitialized if the state transition happens during #onPartitionsAssigned().
         // Should only proceed when the thread is still running after #pollRequests(), because no external state mutation
@@ -809,13 +818,6 @@ public class StreamThread extends Thread {
         if (!isRunning()) {
             log.debug("State already transits to {}, skipping the run once call after poll request", state);
             return;
-        }
-
-        final long pollLatency = advanceNowAndComputeLatency();
-
-        if (records != null && !records.isEmpty()) {
-            pollSensor.record(pollLatency, now);
-            addRecordsToTasks(records);
         }
 
         // we can always let changelog reader to try restoring in order to initialize the changelogs;
@@ -851,11 +853,19 @@ public class StreamThread extends Thread {
 
             do {
                 for (int i = 0; i < numIterations; i++) {
+                    advanceNowAndComputeLatency();
                     processed = taskManager.process(now);
 
                     if (processed > 0) {
+                        // It makes no difference to the outcome of these metrics when we record "0",
+                        // so we can just avoid the method call when we didn't process anything.
+                        processRateSensor.record(processed, now);
+
+                        // This metric is scaled to represent the _average_ processing time of _each_
+                        // task. Note, it's hard to interpret this as defined, but we would need a KIP
+                        // to change it to simply report the overall time spent processing all tasks.
                         final long processLatency = advanceNowAndComputeLatency();
-                        processSensor.record(processLatency / (double) processed, now);
+                        processLatencySensor.record(processLatency / (double) processed, now);
 
                         // commit any tasks that have requested a commit
                         final int committed = taskManager.maybeCommitActiveTasksPerUserRequested();
@@ -1151,6 +1161,10 @@ public class StreamThread extends Thread {
             adminClientId,
             activeTasksMetadata,
             standbyTasksMetadata);
+    }
+
+    public Map<TaskId, Task> activeTaskMap() {
+        return taskManager.activeTaskMap();
     }
 
     public List<Task> activeTasks() {
